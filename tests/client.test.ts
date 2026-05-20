@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: MIT
 /**
- * goodnet-js — smoke tests for `GoodnetClient`.
+ * goodnet-js — smoke tests for `GoodnetClient` over the WS transport.
  *
  * Uses a mock WebSocket constructor that captures every outbound
  * frame and lets the test script back responses synchronously. No
  * real WS server stands up; the mock implements just enough of the
  * `WebSocketLike` interface to exercise the request/response
  * round-trip and the notification path.
+ *
+ * Updated to drive the v0.2 async `GoodnetClient.create({url, ...})`
+ * factory (the WASM transport needs `WebAssembly.instantiate` which
+ * is async; the WS path is async-shaped too for symmetry).
  */
 
 import { describe, it, expect } from 'vitest';
@@ -53,25 +57,34 @@ class MockWebSocket implements WebSocketLike {
 /// Sleep just long enough for queueMicrotask to flush.
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-describe('GoodnetClient', () => {
+/**
+ * Build a `GoodnetClient.create` arg block backed by a shared
+ * mock-WS instance — the constructor signature wants a class, so we
+ * stub one that returns the captured instance on `new`.
+ */
+function harness(): { ws: MockWebSocket; openFactory: () => Promise<GoodnetClient> } {
+  const ws = new MockWebSocket('ws://localhost:9100');
+  return {
+    ws,
+    openFactory: () =>
+      GoodnetClient.create({
+        url: 'ws://localhost:9100',
+        WebSocket: function (this: void) { return ws; } as never,
+      }),
+  };
+}
+
+describe('GoodnetClient (WS transport, via create())', () => {
   it('completes the WS handshake', async () => {
-    const ws = new MockWebSocket('ws://localhost:9100');
-    const client = new GoodnetClient({
-      url: 'ws://localhost:9100',
-      WebSocket: function (this: void) { return ws; } as never,
-    });
-    await client.ready();
+    const { ws, openFactory } = harness();
+    const client = await openFactory();
     expect(ws.readyState).toBe(1);
     client.close();
   });
 
   it('round-trips a `core.connect` request and resolves with the result', async () => {
-    const ws = new MockWebSocket('ws://localhost:9100');
-    const client = new GoodnetClient({
-      url: 'ws://localhost:9100',
-      WebSocket: function (this: void) { return ws; } as never,
-    });
-    await client.ready();
+    const { ws, openFactory } = harness();
+    const client = await openFactory();
 
     const pending = client.connect('tcp://peer.example:9100');
     await flush();
@@ -92,12 +105,8 @@ describe('GoodnetClient', () => {
   });
 
   it('rejects with GoodnetClientError on a JSON-RPC error response', async () => {
-    const ws = new MockWebSocket('ws://localhost:9100');
-    const client = new GoodnetClient({
-      url: 'ws://localhost:9100',
-      WebSocket: function (this: void) { return ws; } as never,
-    });
-    await client.ready();
+    const { ws, openFactory } = harness();
+    const client = await openFactory();
 
     const pending = client.connect('tcp://nowhere:0');
     await flush();
@@ -113,12 +122,8 @@ describe('GoodnetClient', () => {
   });
 
   it('encodes payloads as base64 in `core.send`', async () => {
-    const ws = new MockWebSocket('ws://localhost:9100');
-    const client = new GoodnetClient({
-      url: 'ws://localhost:9100',
-      WebSocket: function (this: void) { return ws; } as never,
-    });
-    await client.ready();
+    const { ws, openFactory } = harness();
+    const client = await openFactory();
 
     const pending = client.send(7, 0x0610, new Uint8Array([0x68, 0x69])); // "hi"
     await flush();
@@ -134,12 +139,8 @@ describe('GoodnetClient', () => {
   });
 
   it('routes notifications to subscribe callbacks', async () => {
-    const ws = new MockWebSocket('ws://localhost:9100');
-    const client = new GoodnetClient({
-      url: 'ws://localhost:9100',
-      WebSocket: function (this: void) { return ws; } as never,
-    });
-    await client.ready();
+    const { ws, openFactory } = harness();
+    const client = await openFactory();
 
     const received: Uint8Array[] = [];
     const sub = client.subscribe(11, 0x0700, (p) => received.push(p));
@@ -167,12 +168,8 @@ describe('GoodnetClient', () => {
   });
 
   it('rejects pending calls when the underlying WS closes', async () => {
-    const ws = new MockWebSocket('ws://localhost:9100');
-    const client = new GoodnetClient({
-      url: 'ws://localhost:9100',
-      WebSocket: function (this: void) { return ws; } as never,
-    });
-    await client.ready();
+    const { ws, openFactory } = harness();
+    const client = await openFactory();
 
     const pending = client.connect('tcp://peer:9100');
     await flush();

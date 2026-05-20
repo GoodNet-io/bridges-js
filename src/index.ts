@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: MIT
 /**
- * goodnet-js — browser-first JavaScript client for the goodnetd
- * WS gateway (handler-web-api-proxy).
+ * goodnet-js — JavaScript / TypeScript client for the goodnetd
+ * kernel. Two transports share a single `GoodnetClient` surface:
  *
- * The library wraps a single WebSocket connection to a goodnetd
- * instance and exposes the v0.1 JSON-RPC surface advertised by
- * `gn.handler.web-api-proxy`: connect / send / subscribe / disconnect
- * plus two introspection calls. v0.1 is a thin transport — every
- * call serialises as `{"jsonrpc":"2.0","method":...,"id":...,...}`,
- * the gateway's response is matched by id, and notifications fan
- * out to subscribe callbacks.
+ *   1. **WS thin client** (`{url: 'ws://...'}`). Opens a WebSocket
+ *      to a remote `goodnetd` and speaks the JSON-RPC dialect
+ *      advertised by `gn.handler.web-api-proxy`. ~10 KB bundle,
+ *      needs a daemon.
+ *
+ *   2. **WASM full kernel** (`{wasm: '/goodnet.wasm'}`). Instantiates
+ *      the kernel itself inside the tab and registers JS handlers
+ *      as native plugins via the `gn_core_register_runtime` C ABI
+ *      (kernel commit 4e3558d, sdk/plugin_runtime.h). No daemon,
+ *      browser-as-peer. ~600 KB-1.5 MB bundle. v0.2 ships the
+ *      surface; the dynCall wire-up follows when the emscripten
+ *      Module exports are pinned — `WasmTransport.create()`
+ *      currently throws a documented "pending impl" error.
  *
  * Browser usage:
  * ```ts
  * import { GoodnetClient } from 'goodnet-js';
- * const gn = new GoodnetClient({ url: 'ws://localhost:9100' });
+ * const gn = await GoodnetClient.create({ url: 'ws://localhost:9100' });
  * const { conn_id } = await gn.connect('tcp://peer.example:9100');
  * await gn.send(conn_id, 0x0610, new TextEncoder().encode('hello'));
  * gn.close();
@@ -25,9 +31,23 @@
  * runtime closure):
  * ```ts
  * import WebSocket from 'ws';
- * const gn = new GoodnetClient({ url: '...', WebSocket });
+ * const gn = await GoodnetClient.create({ url: '...', WebSocket });
  * ```
  */
+
+import {
+  WasmTransport,
+  type WasmTransportOptions,
+  type GnMessage,
+  Propagation,
+} from './WasmTransport.js';
+
+export {
+  WasmTransport,
+  type WasmTransportOptions,
+  type GnMessage,
+  Propagation,
+};
 
 /**
  * Subset of the `WebSocket` interface the client requires. Lines up
@@ -49,6 +69,10 @@ export interface WebSocketLike {
 /** Constructor signature so callers can inject a Node-side `WebSocket`. */
 export type WebSocketCtor = new (url: string, protocols?: string | string[]) => WebSocketLike;
 
+/**
+ * Options for the WS thin-client transport. Pass either this or a
+ * `{wasm}` block — see {@link GoodnetClientOptions}.
+ */
 export interface GoodnetClientOpts {
   /** URL to dial — `ws://goodnetd-host:9100` or wss equivalent. */
   url: string;
@@ -57,6 +81,22 @@ export interface GoodnetClientOpts {
    * Defaults to the browser's global `WebSocket`.
    */
   WebSocket?: WebSocketCtor;
+}
+
+/**
+ * Union of every transport-selection knob accepted by
+ * {@link GoodnetClient.create}. Exactly one of `url` or `wasm`
+ * must be set.
+ */
+export interface GoodnetClientOptions {
+  /** Existing — open a WS thin client against `web_api_proxy`. */
+  url?: string;
+  /** Inject a custom WebSocket constructor (Node-side, tests). */
+  WebSocket?: WebSocketCtor;
+  /** New — instantiate a full kernel WASM blob inside the tab. */
+  wasm?: string | ArrayBuffer;
+  /** Optional 64-byte Ed25519 secret for the WASM-kernel identity. */
+  identity?: Uint8Array;
 }
 
 export interface ConnectResult {
@@ -70,8 +110,8 @@ export interface Subscription {
 }
 
 /**
- * Reject every in-flight request with this error when the underlying
- * WS closes before a response arrives.
+ * Rejected from every in-flight request when the underlying
+ * transport closes before a response arrives.
  */
 export class GoodnetClientError extends Error {
   constructor(public readonly code: number, message: string) {
@@ -135,23 +175,43 @@ function fromBase64(s: string): Uint8Array {
 }
 
 /**
- * Browser-side wrapper for the goodnetd WS gateway. Owns a single
- * WebSocket; serialises requests, demultiplexes responses by id,
- * routes notifications to registered subscribers.
+ * Browser-side wrapper for the goodnetd. Owns either a WS gateway
+ * connection (thin client) or a WASM kernel instance (full peer);
+ * exposes the same {@link connect}/{@link send}/{@link subscribe}
+ * surface to callers regardless of which transport sits underneath.
+ *
+ * Prefer the async {@link GoodnetClient.create} factory — the WASM
+ * path needs `WebAssembly.instantiate` which is asynchronous. The
+ * legacy `new GoodnetClient({url, WebSocket})` constructor is kept
+ * for the WS path only (and is what the mock-WS test suite uses).
  */
 export class GoodnetClient {
-  private readonly ws: WebSocketLike;
+  private readonly ws: WebSocketLike | null = null;
+  private readonly wasm: WasmTransport | null = null;
   private nextId = 1;
   private readonly pending = new Map<string, PendingCall>();
-  // (conn_id << 32) | msg_id → callback list. v0.1 holds at most
-  // a few entries per client; no need for a fancier index.
+  // (conn_id, msg_id) → callback list. v0.1 holds at most a few
+  // entries per client; no need for a fancier index.
   private readonly subscriptions = new Map<string, Set<(payload: Uint8Array) => void>>();
   private openPromise: Promise<void>;
   private closed = false;
 
-  constructor(opts: GoodnetClientOpts) {
+  /**
+   * Direct WS constructor (existing v0.1 surface). For the WASM
+   * transport use {@link GoodnetClient.create} which is async.
+   */
+  constructor(opts: GoodnetClientOpts);
+  /** @internal — used by {@link GoodnetClient.create} for the WASM path. */
+  constructor(opts: { wasm: WasmTransport });
+  constructor(opts: GoodnetClientOpts | { wasm: WasmTransport }) {
+    if ('wasm' in opts) {
+      this.wasm = opts.wasm;
+      this.openPromise = Promise.resolve();
+      return;
+    }
+    const wsOpts = opts;
     const Ctor =
-      opts.WebSocket ??
+      wsOpts.WebSocket ??
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       ((globalThis as any).WebSocket as WebSocketCtor | undefined);
     if (!Ctor) {
@@ -160,25 +220,66 @@ export class GoodnetClient {
         'No WebSocket constructor available. Pass one explicitly when running outside the browser.',
       );
     }
-    this.ws = new Ctor(opts.url);
+    this.ws = new Ctor(wsOpts.url);
     this.openPromise = new Promise((resolve, reject) => {
-      this.ws.onopen = () => resolve();
-      this.ws.onerror = (ev) => reject(new GoodnetClientError(-2, `WS error: ${String(ev)}`));
+      this.ws!.onopen = () => resolve();
+      this.ws!.onerror = (ev) =>
+        reject(new GoodnetClientError(-2, `WS error: ${String(ev)}`));
     });
     this.ws.onmessage = (ev) => this.handleMessage(ev.data);
     this.ws.onclose = () => this.failPending('WS connection closed');
   }
 
-  /** Wait until the WS handshake completes. */
+  /**
+   * Async factory — picks the transport implied by `opts`:
+   *   - `{url}` → WS thin client (resolves once the handshake is done).
+   *   - `{wasm}` → WASM full kernel (resolves once the kernel is up).
+   *
+   * Throws if both or neither are supplied.
+   */
+  static async create(opts: GoodnetClientOptions): Promise<GoodnetClient> {
+    if (opts.wasm && opts.url) {
+      throw new GoodnetClientError(
+        -5,
+        'GoodnetClient.create: pass exactly one of {url} or {wasm}, not both.',
+      );
+    }
+    if (opts.wasm) {
+      const wasmOpts: WasmTransportOptions = { wasm: opts.wasm };
+      if (opts.identity) wasmOpts.identity = opts.identity;
+      const t = await WasmTransport.create(wasmOpts);
+      return new GoodnetClient({ wasm: t });
+    }
+    if (opts.url) {
+      const wsOpts: GoodnetClientOpts = { url: opts.url };
+      if (opts.WebSocket) wsOpts.WebSocket = opts.WebSocket;
+      const c = new GoodnetClient(wsOpts);
+      await c.ready();
+      return c;
+    }
+    throw new GoodnetClientError(
+      -6,
+      'GoodnetClient.create: pass either {url} (WS thin client) or {wasm} (full kernel in browser).',
+    );
+  }
+
+  /** Wait until the WS handshake completes (no-op on the WASM path). */
   ready(): Promise<void> {
     return this.openPromise;
   }
 
   /**
-   * Open a goodnet connection to @p uri through the gateway. Maps to
-   * JSON-RPC `core.connect`.
+   * Open a goodnet connection to @p uri. Maps to JSON-RPC
+   * `core.connect` on the WS path; not yet wired on the WASM path
+   * (returns a documented "pending" error there).
    */
   async connect(uri: string): Promise<ConnectResult> {
+    if (this.wasm) {
+      throw new GoodnetClientError(
+        -7,
+        'GoodnetClient.connect: not yet implemented on the WASM transport',
+      );
+    }
     const r = (await this.call('core.connect', { uri })) as ConnectResult;
     return r;
   }
@@ -188,6 +289,12 @@ export class GoodnetClient {
    * `core.send`. Payload is base64-encoded over the wire.
    */
   async send(conn_id: number, msg_id: number, payload: Uint8Array): Promise<void> {
+    if (this.wasm) {
+      throw new GoodnetClientError(
+        -7,
+        'GoodnetClient.send: not yet implemented on the WASM transport',
+      );
+    }
     await this.call('core.send', {
       conn_id,
       msg_id_hex: '0x' + msg_id.toString(16).padStart(4, '0'),
@@ -197,15 +304,22 @@ export class GoodnetClient {
 
   /**
    * Register a callback for frames matching (`conn_id`, `msg_id`).
-   * The gateway pushes `core.notify` notifications when a matching
-   * envelope arrives; the callback is invoked with the decoded
-   * payload bytes.
+   * On the WS path this maps to JSON-RPC `core.subscribe` plus a
+   * `core.notify` fan-out. On the WASM path you usually want
+   * {@link GoodnetClient.handler} instead — it registers a JS
+   * function as a kernel plugin and gets zero-copy memory views.
    */
   subscribe(
     conn_id: number,
     msg_id: number,
     cb: (payload: Uint8Array) => void,
   ): Subscription {
+    if (this.wasm) {
+      throw new GoodnetClientError(
+        -7,
+        'GoodnetClient.subscribe: not yet implemented on the WASM transport — use handler({msg_id, on_message}) for the kernel-side path.',
+      );
+    }
     const key = subscriptionKey(conn_id, msg_id);
     let set = this.subscriptions.get(key);
     if (!set) {
@@ -231,27 +345,97 @@ export class GoodnetClient {
     };
   }
 
+  /**
+   * Register a JS function as a kernel-side handler for @p msg_id.
+   *
+   * On the WASM transport the callback runs as a native plugin —
+   * the kernel calls it directly via the C ABI in
+   * `sdk/plugin_runtime.h`, the JS side gets a `Uint8Array` view
+   * into linear memory (zero copy, valid only during the callback).
+   *
+   * On the WS transport this falls back to a JSON-RPC subscribe
+   * with a `conn_id` of 0 — every connection's traffic for that
+   * msg_id is delivered to the callback after a base64 decode. The
+   * return value (`Propagation`) is forwarded as a hint; the
+   * gateway in v0.1 currently ignores it.
+   */
+  async handler(opts: {
+    msg_id: number;
+    on_message: (env: GnMessage) => Propagation;
+  }): Promise<void> {
+    if (this.wasm) {
+      this.wasm.registerHandler(opts.msg_id, opts.on_message);
+      return;
+    }
+    // WS fallback: subscribe with conn_id=0 (wildcard) and adapt
+    // base64 notifications into GnMessage envelopes.
+    await this.call('core.subscribe', {
+      msg_id_hex: '0x' + opts.msg_id.toString(16).padStart(4, '0'),
+    }).catch(() => {
+      /* swallow — v0.1 skeleton returns "not implemented" */
+    });
+    const key = subscriptionKey(0, opts.msg_id);
+    let set = this.subscriptions.get(key);
+    if (!set) {
+      set = new Set();
+      this.subscriptions.set(key, set);
+    }
+    set.add((payload) => {
+      opts.on_message({
+        msg_id: opts.msg_id,
+        conn_id: 0n,
+        payload,
+      });
+    });
+  }
+
   /** Close the gateway-side conn id. */
   async disconnect(conn_id: number): Promise<void> {
+    if (this.wasm) {
+      throw new GoodnetClientError(
+        -7,
+        'GoodnetClient.disconnect: not yet implemented on the WASM transport',
+      );
+    }
     await this.call('core.disconnect', { conn_id });
   }
 
   /** List the handlers registered on the goodnetd. Diagnostic. */
   async listHandlers(): Promise<unknown> {
+    if (this.wasm) {
+      throw new GoodnetClientError(
+        -7,
+        'GoodnetClient.listHandlers: not yet implemented on the WASM transport',
+      );
+    }
     return this.call('core.handlers.list', {});
   }
 
   /** List the links registered on the goodnetd. Diagnostic. */
   async listLinks(): Promise<unknown> {
+    if (this.wasm) {
+      throw new GoodnetClientError(
+        -7,
+        'GoodnetClient.listLinks: not yet implemented on the WASM transport',
+      );
+    }
     return this.call('core.links.list', {});
   }
 
-  /** Close the underlying WebSocket. After this every call rejects. */
+  /**
+   * Close the underlying transport. After this every call rejects.
+   * Idempotent.
+   */
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    this.ws.close();
-    this.failPending('client closed');
+    if (this.ws) {
+      this.ws.close();
+      this.failPending('client closed');
+    }
+    if (this.wasm) {
+      void this.wasm.close();
+    }
   }
 
   // ── private ──────────────────────────────────────────────────────
@@ -260,13 +444,16 @@ export class GoodnetClient {
     if (this.closed) {
       throw new GoodnetClientError(-3, 'client closed');
     }
+    if (!this.ws) {
+      throw new GoodnetClientError(-7, 'WS call on non-WS transport');
+    }
     await this.openPromise;
     const id = String(this.nextId++);
     const req: JsonRpcRequest = { jsonrpc: '2.0', method, id, params };
     return new Promise<unknown>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       try {
-        this.ws.send(JSON.stringify(req));
+        this.ws!.send(JSON.stringify(req));
       } catch (err) {
         this.pending.delete(id);
         reject(err instanceof Error ? err : new Error(String(err)));
@@ -292,10 +479,14 @@ export class GoodnetClient {
         typeof params.msg_id === 'number' &&
         typeof params.payload_b64 === 'string'
       ) {
-        const key = subscriptionKey(params.conn_id, params.msg_id);
-        const set = this.subscriptions.get(key);
-        if (set) {
-          const bytes = fromBase64(params.payload_b64);
+        const bytes = fromBase64(params.payload_b64);
+        // Fan out to (conn_id, msg_id) subscribers AND to the
+        // wildcard (0, msg_id) handlers registered via handler().
+        const exact = subscriptionKey(params.conn_id, params.msg_id);
+        const wildcard = subscriptionKey(0, params.msg_id);
+        for (const k of [exact, wildcard]) {
+          const set = this.subscriptions.get(k);
+          if (!set) continue;
           for (const cb of set) {
             try { cb(bytes); } catch { /* user cb threw — ignore */ }
           }

@@ -1,7 +1,7 @@
 {
   "name": "goodnet-js",
-  "version": "0.1.0",
-  "description": "JavaScript / TypeScript client for the goodnetd WS gateway (handler-web-api-proxy).",
+  "version": "0.2.0",
+  "description": "JavaScript / TypeScript client for goodnetd — WS thin client or full kernel WASM in the browser.",
   "license": "MIT",
   "author": "GoodNet contributors",
   "homepage": "https://github.com/GoodNet-io/bridges-js",
@@ -13,6 +13,7 @@
     "goodnet",
     "p2p",
     "websocket",
+    "wasm",
     "json-rpc",
     "bridge"
   ],
