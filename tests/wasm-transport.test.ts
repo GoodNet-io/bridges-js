@@ -1,19 +1,32 @@
 // SPDX-License-Identifier: MIT
 /**
- * goodnet-js — surface-stability tests for the WASM transport.
+ * goodnet-js — round-trip tests for the WASM transport.
  *
- * v0.2 ships the API surface; the dynCall thunking sits behind a
- * documented "pending impl" guard until the emscripten Module
- * exports are pinned. These tests lock in:
+ * v0.3 ships the real wiring (alpha): `WasmTransport.create()`
+ * instantiates the artefact, calls `_gn_core_create → init →
+ * register_runtime → start`, and exposes a `register_plugin` thunk
+ * the kernel uses to bind JS handlers as native plugins.
  *
- *   1. `GoodnetClient.create({wasm})` rejects with the documented
- *      "pending" error (so apps that wire against it early get a
- *      clear signal, not a silent stall);
+ * The suite drives the alpha against a hand-rolled stub `.wasm`
+ * fixture (`tests/fixtures/stub-wasm.ts`) — every C entry point
+ * returns `GN_OK` so the boot sequence completes without a real
+ * kernel. The production goodnet.wasm path stays valid by
+ * exporting the same surface plus a real plugin manager.
  *
- *   2. The exported type surface — `GnMessage`, `Propagation`,
- *      `handler(...)` — is in place. This is a compile-time check
- *      on the test file; if the surface drifts the import below
- *      starts failing TypeScript and `npm test` no longer compiles.
+ * Tests lock in:
+ *
+ *   1. `WasmTransport.create({wasm: stubBytes})` resolves without
+ *      throwing — the full bootstrap sequence runs to `_gn_core_start`.
+ *
+ *   2. `GoodnetClient.create({wasm: stubBytes})` wraps the transport
+ *      without surfacing a "pending impl" error.
+ *
+ *   3. The `register_plugin` thunk recognises a synthetic
+ *      `js-handler-${msg_id}` name and round-trips a registered JS
+ *      callback through the kernel-facing dispatch path.
+ *
+ *   4. The exported type surface (`GnMessage`, `Propagation`,
+ *      `handler(...)`) is still in place — drift breaks the build.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -24,18 +37,37 @@ import {
   type GnMessage,
   type WasmTransportOptions,
 } from '../src/index.js';
+import { buildStubWasm } from './fixtures/stub-wasm.js';
 
 describe('WasmTransport', () => {
-  it('CreatePendingImpl — GoodnetClient.create({wasm}) throws the documented "pending" error', async () => {
-    await expect(
-      GoodnetClient.create({ wasm: '/path/to/goodnet.wasm' }),
-    ).rejects.toThrow(/pending Module exports wire-up/);
+  it('Create — boots against a stub WASM artefact without throwing', async () => {
+    const stub = buildStubWasm();
+    const t = await WasmTransport.create({ wasm: stub });
+    expect(t).toBeInstanceOf(WasmTransport);
+    await t.close();
   });
 
-  it('CreatePendingImpl — WasmTransport.create() directly also throws "pending"', async () => {
+  it('Create — via `GoodnetClient.create({wasm})` returns a usable client', async () => {
+    const stub = buildStubWasm();
+    const gn = await GoodnetClient.create({ wasm: stub });
+    expect(gn).toBeInstanceOf(GoodnetClient);
+    gn.close();
+  });
+
+  it('Create — boots with an inline 64-byte Ed25519 identity', async () => {
+    const stub = buildStubWasm();
+    const identity = new Uint8Array(64);
+    identity[0] = 0xab; // arbitrary non-zero so the path is exercised
+    const t = await WasmTransport.create({ wasm: stub, identity });
+    expect(t).toBeInstanceOf(WasmTransport);
+    await t.close();
+  });
+
+  it('Create — rejects an identity of the wrong length', async () => {
+    const stub = buildStubWasm();
     await expect(
-      WasmTransport.create({ wasm: '/path/to/goodnet.wasm' }),
-    ).rejects.toThrow(/pending Module exports wire-up/);
+      WasmTransport.create({ wasm: stub, identity: new Uint8Array(32) }),
+    ).rejects.toThrow(/identity must be 64 bytes/);
   });
 
   it('Create — rejects when neither {url} nor {wasm} is supplied', async () => {
@@ -46,8 +78,59 @@ describe('WasmTransport', () => {
 
   it('Create — rejects when both {url} and {wasm} are supplied', async () => {
     await expect(
-      GoodnetClient.create({ url: 'ws://x', wasm: '/y.wasm' }),
+      GoodnetClient.create({ url: 'ws://x', wasm: buildStubWasm() }),
     ).rejects.toThrow(/exactly one/);
+  });
+
+  it('RegisterPlugin — round-trips a `js-handler-${msg_id}` name through the thunk', async () => {
+    const stub = buildStubWasm();
+    const t = await WasmTransport.create({ wasm: stub });
+
+    let received: GnMessage | null = null;
+    t.registerHandler(0x0610, (env) => {
+      received = env;
+      return Propagation.CONSUMED;
+    });
+
+    // Simulate the kernel calling the register_plugin thunk for the
+    // synthetic name `js-handler-${msg_id}`. Returns the minted
+    // instance handle (a non-zero u32 per sdk/plugin_runtime.h).
+    const instance = t.__debugInvokeRegisterPlugin('js-handler-1552');
+    expect(instance).toBeGreaterThan(0);
+
+    // Simulate the kernel dispatching a frame to that handler.
+    const rc = t.__debugDispatch(
+      0x0610,
+      99n,
+      new TextEncoder().encode('hello'),
+    );
+    expect(rc).toBe(Propagation.CONSUMED);
+    expect(received).not.toBeNull();
+    expect(received!.msg_id).toBe(0x0610);
+    expect(received!.conn_id).toBe(99n);
+    expect(new TextDecoder().decode(received!.payload)).toBe('hello');
+
+    await t.close();
+  });
+
+  it('RegisterPlugin — returns 0 (GN_PLUGIN_INSTANCE_INVALID) for an unknown name', async () => {
+    const stub = buildStubWasm();
+    const t = await WasmTransport.create({ wasm: stub });
+    expect(t.__debugInvokeRegisterPlugin('not-a-js-handler')).toBe(0);
+    expect(t.__debugInvokeRegisterPlugin('js-handler-9999')).toBe(0); // never registered
+    await t.close();
+  });
+
+  it('Close — is idempotent and clears the handler table', async () => {
+    const stub = buildStubWasm();
+    const t = await WasmTransport.create({ wasm: stub });
+    t.registerHandler(1, () => Propagation.CONSUMED);
+    await t.close();
+    await t.close(); // no throw
+    // After close, registerHandler refuses further work.
+    expect(() => t.registerHandler(2, () => Propagation.CONSUMED)).toThrow(
+      /closed/,
+    );
   });
 
   it('TypeSurfaceStable — Propagation enum carries the three documented variants', () => {

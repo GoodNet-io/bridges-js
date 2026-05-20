@@ -8,21 +8,24 @@
 | **WS thin client** (`{url: 'ws://...'}`) | Browser tab talks to a remote `goodnetd` via the `gn.handler.web-api-proxy` JSON-RPC. | ~10 KB | Needs `goodnetd` running somewhere. |
 | **WASM full kernel** (`{wasm: '/goodnet.wasm'}`) | Browser tab _is_ a full GoodNet peer — no daemon at all. JS handlers run as native plugins of the in-tab kernel via the C ABI in `sdk/plugin_runtime.h`. | ~600 KB-1.5 MB (lazy fetch; unused if WS picked). | No. |
 
-## Status — v0.2
+## Status — v0.3 (alpha)
 
 The WS path is unchanged from v0.1 — the gateway-side handler still
 replies with `"not implemented in v0.1 skeleton"` to every advertised
-method (see `plugins/handlers/web_api_proxy/`); v0.2 fills the
-dispatch in without breaking this package's contract.
+method (see `plugins/handlers/web_api_proxy/`); the in-tree
+dispatch fill-in lands on the kernel side without breaking this
+package's contract.
 
-The WASM path ships in v0.2 as a **stable type surface** —
-`WasmTransport.create()` currently throws a documented
-"pending Module exports wire-up" error, because the emscripten
-glue + `EXPORTED_FUNCTIONS` list still needs pinning on the kernel
-side (kernel commit `4e3558d` landed `sdk/plugin_runtime.h`; the
-companion `goodnet.wasm` artefact follows). Apps can be written
-against the v0.2 API and they will keep compiling as the impl
-lands in v0.3.x.
+The WASM path is **wired against a stub `.wasm`** in v0.3:
+`WasmTransport.create()` instantiates the artefact, calls
+`_gn_core_create → _gn_core_init → _gn_core_register_runtime →
+_gn_core_start`, and binds JS callbacks as kernel-side plugins via
+the four-thunk `gn_plugin_runtime_vtable_t` defined in
+`sdk/plugin_runtime.h` (kernel commit `4e3558d`). The production
+`goodnet.wasm` blob (with libsodium-emscripten) ships from the
+kernel build separately — once it lands the same call sequence
+holds, only the artefact pointer changes. Apps written against the
+v0.2 type surface keep compiling untouched.
 
 ## Install
 
@@ -63,7 +66,7 @@ gn.close();
 on the WASM path, the kernel boot) so the rest of your code can
 assume the transport is up.
 
-## Browser usage — WASM full kernel (v0.2 surface, impl pending)
+## Browser usage — WASM full kernel (v0.3 alpha)
 
 ```ts
 import { GoodnetClient, Propagation } from 'goodnet-js';
@@ -171,9 +174,10 @@ back into JS with the `gn_message_t*`, and the JS side reads the
 payload via `Module.HEAPU8.subarray(p, p + n)` — zero copy.
 
 ABI source-of-truth: `sdk/plugin_runtime.h` (kernel commit
-`4e3558d`). The contract is stable; the JS-side dynCall thunking is
-gated on the emscripten Module exports being pinned, which lands in
-v0.3.x.
+`4e3558d`). The contract is stable; v0.3 ships the JS-side thunking
+tested against a hand-rolled stub `.wasm` fixture, and the
+production `goodnet.wasm` (libsodium-emscripten build) wires
+through the same call sequence once it ships from the kernel.
 
 ## Develop
 

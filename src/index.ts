@@ -12,10 +12,10 @@
  *      the kernel itself inside the tab and registers JS handlers
  *      as native plugins via the `gn_core_register_runtime` C ABI
  *      (kernel commit 4e3558d, sdk/plugin_runtime.h). No daemon,
- *      browser-as-peer. ~600 KB-1.5 MB bundle. v0.2 ships the
- *      surface; the dynCall wire-up follows when the emscripten
- *      Module exports are pinned — `WasmTransport.create()`
- *      currently throws a documented "pending impl" error.
+ *      browser-as-peer. ~600 KB-1.5 MB bundle. v0.3 ships alpha
+ *      wiring tested against a stub `.wasm` fixture; the production
+ *      `goodnet.wasm` (libsodium-emscripten) is a kernel-side
+ *      track.
  *
  * Browser usage:
  * ```ts

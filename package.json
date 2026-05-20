@@ -1,6 +1,6 @@
 {
   "name": "goodnet-js",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "JavaScript / TypeScript client for goodnetd — WS thin client or full kernel WASM in the browser.",
   "license": "MIT",
   "author": "GoodNet contributors",
