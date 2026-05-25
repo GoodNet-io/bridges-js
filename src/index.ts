@@ -29,6 +29,24 @@
  * ```
  */
 
+import {
+  WasmTransport,
+  type WasmTransportOptions,
+  type GnMessage,
+  Propagation,
+} from './WasmTransport.js';
+
+export {
+  WasmTransport,
+  type WasmTransportOptions,
+  type GnMessage,
+  Propagation,
+};
+
+export type { GoodnetTransport, MessageHandler } from './transport.js';
+export { WsTransport } from './WsTransport.js';
+
+
 /**
  * Subset of the `WebSocket` interface the client requires. Lines up
  * with both the browser's built-in WebSocket and the npm `ws`
@@ -328,3 +346,13 @@ export class GoodnetClient {
 function subscriptionKey(conn_id: number, msg_id: number): string {
   return `${conn_id}:${msg_id}`;
 }
+
+import type { GoodnetTransport } from './transport.js';
+import { WsTransport } from './WsTransport.js';
+
+/** Picks the right transport for a given URL. */
+export const Goodnet = {
+  via(url: string): Promise<GoodnetTransport> {
+    return WsTransport.connect(url);
+  },
+};
