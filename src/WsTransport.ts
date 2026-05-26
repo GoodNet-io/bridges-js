@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-import type { GoodnetTransport, MessageHandler, Subscription } from './transport.js';
+import type { GoodnetTransport, MessageHandler, Subscription, ConnectResult } from './transport.js';
 
 interface PendingCall {
     resolve: (value: unknown) => void;
@@ -140,6 +140,11 @@ export class WsTransport implements GoodnetTransport {
             msg_id_hex: '0x' + msg_id.toString(16).padStart(4, '0'),
             payload_b64: toBase64(payload),
         });
+    }
+
+    async connect(uri: string): Promise<ConnectResult> {
+        const r = await this.rpc('core.connect', { uri }) as { conn_id: number; peer_pubkey: string };
+        return { conn_id: BigInt(r.conn_id), peer_pubkey: r.peer_pubkey };
     }
 
     async disconnect(conn_id: bigint): Promise<void> {

@@ -1,25 +1,18 @@
-# goodnet-js — JavaScript / TypeScript client for the goodnetd WS gateway
+# goodnet-js
 
-`npm`-installable wrapper that talks the JSON-RPC dialect served by
-the `gn.handler.web-api-proxy` plugin. The browser tab connects to a
-running `goodnetd` over `ws://goodnetd-host:9100` and writes code as
-if the kernel were native — the gateway proxies every call into the
-real goodnet peer.
+TypeScript / JavaScript client for the GoodNet kernel. Two transports,
+one interface — application code is identical regardless of which backend
+is active.
 
-## Status — v0.1
+## Transports
 
-The wire envelope is pinned. The kernel-side handler currently
-replies with `"not implemented in v0.1 skeleton"` to every advertised
-method (see `plugins/handlers/web_api_proxy/`); v0.2 fills the
-dispatch in without breaking this package's contract.
+| Transport | How it works | When to use |
+|-----------|-------------|-------------|
+| **WsTransport** | Thin JSON-RPC client over WebSocket to a running `goodnetd` daemon. ~10 KB bundle. | Server-side apps, dashboards, any environment where a daemon runs nearby. |
+| **WasmTransport** | Full GoodNet kernel compiled to WASM, running in-process. No daemon. The browser tab IS the peer. | Browser-as-peer, offline-capable apps, environments where you cannot run a daemon. |
 
-What this package ships:
-
-- `GoodnetClient` — single-WS, request/response, notification
-  subscriptions.
-- TypeScript-first, browser-default. Node consumers inject `ws`
-  through the constructor.
-- Vitest-driven mock-WS smoke suite.
+Both implement `GoodnetTransport`. The backend is chosen once at startup
+and invisible from that point on.
 
 ## Install
 
@@ -27,99 +20,112 @@ What this package ships:
 npm install goodnet-js
 ```
 
-The package has zero runtime dependencies in the browser bundle.
-Node consumers need the `ws` npm package:
+Zero runtime dependencies in the browser bundle. Node consumers need `ws`:
 
 ```sh
 npm install ws
 ```
 
-## Browser usage
+## Usage
 
 ```ts
-import { GoodnetClient } from 'goodnet-js';
+import { Goodnet } from 'goodnet-js';
 
-const gn = new GoodnetClient({ url: 'ws://localhost:9100' });
-await gn.ready();
+// Connect to a running goodnetd daemon:
+const gn = await Goodnet.create({ url: 'ws://localhost:9100' });
 
-const { conn_id, peer_pubkey } = await gn.connect('tcp://peer.example:9100');
-console.log('peer pubkey:', peer_pubkey);
+// — or — run the kernel in-process (no daemon):
+const gn = await Goodnet.create({ wasm: '/goodnet.wasm' });
 
-await gn.send(conn_id, 0x0610, new TextEncoder().encode('hello'));
+// The rest of the code is the same either way:
+const { conn_id } = await gn.connect('tcp://peer.example:9100');
 
-const sub = gn.subscribe(conn_id, 0x0610, (payload) => {
-  console.log('inbound:', new TextDecoder().decode(payload));
+gn.on(0x0700, (payload, conn_id) => {
+    console.log('from', conn_id, new TextDecoder().decode(payload));
 });
 
+await gn.send(conn_id, 0x0700, new TextEncoder().encode('hello'));
+
 // ...later
-sub.unsubscribe();
 await gn.disconnect(conn_id);
 gn.close();
 ```
 
-## Node.js usage
+## Node.js
 
-The browser's built-in `WebSocket` isn't available; pass `ws`:
+Pass the `ws` constructor explicitly — the package is browser-first:
 
 ```ts
 import WebSocket from 'ws';
-import { GoodnetClient } from 'goodnet-js';
+import { Goodnet } from 'goodnet-js';
 
-const gn = new GoodnetClient({
-  url: 'ws://localhost:9100',
-  WebSocket: WebSocket as never,
-});
+const gn = await Goodnet.create({ url: 'ws://localhost:9100', WebSocket });
 ```
 
-## Ten-line counter app
+## GoodnetTransport interface
 
 ```ts
-import { GoodnetClient } from 'goodnet-js';
-const gn = new GoodnetClient({ url: 'ws://localhost:9100' });
-const { conn_id } = await gn.connect('tcp://peer.example:9100');
-let n = 0;
-gn.subscribe(conn_id, 0x0610, (p) => {
-  n += new DataView(p.buffer).getUint32(0, false);
-  console.log('counter =', n);
-});
-setInterval(() => {
-  const buf = new Uint8Array(4);
-  new DataView(buf.buffer).setUint32(0, 1, false);
-  void gn.send(conn_id, 0x0610, buf);
-}, 1000);
+interface GoodnetTransport {
+    connect(uri: string): Promise<ConnectResult>;          // conn_id: bigint
+    on(msg_id: number, handler: MessageHandler): Subscription;
+    send(conn_id: bigint, msg_id: number, payload: Uint8Array): Promise<void>;
+    disconnect(conn_id: bigint): Promise<void>;
+    close(): void;
+}
 ```
 
-## Wire dialect (v0.1)
+`conn_id` is `bigint` throughout — it mirrors `gn_conn_id_t` (uint64) in
+the C kernel ABI.
 
-Each call serialises as a JSON-RPC 2.0 frame:
+## Using transports directly
+
+```ts
+import { WsTransport, WasmTransport } from 'goodnet-js';
+
+// WsTransport factory:
+const ws = await WsTransport.connect('ws://localhost:9100');
+
+// WasmTransport factory:
+const wasm = await WasmTransport.create({ wasm: '/goodnet.wasm' });
+```
+
+## Wire dialect (WsTransport)
+
+Each call is a JSON-RPC 2.0 frame matched by `id`:
 
 ```json
-{ "jsonrpc": "2.0", "method": "core.connect", "id": "1", "params": { "uri": "..." } }
+{ "jsonrpc": "2.0", "method": "core.connect", "id": "1",
+  "params": { "uri": "tcp://peer:9100" } }
+
+{ "jsonrpc": "2.0", "id": "1",
+  "result": { "conn_id": 17, "peer_pubkey": "deadbeef..." } }
 ```
 
-Responses match by `id`:
-
-```json
-{ "jsonrpc": "2.0", "id": "1", "result": { "conn_id": 17, "peer_pubkey": "deadbeef" } }
-```
-
-Notifications carry no `id`:
+Inbound notifications carry no `id`:
 
 ```json
 { "jsonrpc": "2.0", "method": "core.notify",
-  "params": { "conn_id": 17, "msg_id": 1552, "payload_b64": "aGVsbG8=" } }
+  "params": { "conn_id": 17, "msg_id": 1792, "payload_b64": "aGVsbG8=" } }
 ```
 
-Methods advertised by v0.1:
-`core.connect`, `core.send`, `core.subscribe`, `core.disconnect`,
-`core.handlers.list`, `core.links.list`.
+Methods: `core.connect`, `core.send`, `core.subscribe`,
+`core.disconnect`, `core.handlers.list`, `core.links.list`.
+
+## WasmTransport status
+
+The full WASM kernel build (goodnet.wasm with libsodium-emscripten) is a
+kernel-side track. Until it lands, `WasmTransport.create()` returns a
+type-correct instance; `on()` and `close()` work immediately;
+`connect()`, `send()`, and `disconnect()` throw `WasmTransportError` with
+a clear message. Tests use `__debugDispatch()` to exercise handler logic
+without the WASM binary.
 
 ## Develop
 
 ```sh
 npm install
-npm test        # vitest run — mock-WS smoke
-npm run build   # tsup → dist/index.{mjs,cjs,d.ts}
+npm test        # vitest — 12 tests
+npm run build   # tsup → dist/
 ```
 
 ## License

@@ -1,7 +1,7 @@
 {
   "name": "goodnet-js",
-  "version": "0.1.0",
-  "description": "JavaScript / TypeScript client for the goodnetd WS gateway (handler-web-api-proxy).",
+  "version": "0.3.0",
+  "description": "TypeScript / JavaScript client for the GoodNet kernel — WsTransport (thin JSON-RPC) and WasmTransport (in-process kernel), one GoodnetTransport interface.",
   "license": "MIT",
   "author": "GoodNet contributors",
   "homepage": "https://github.com/GoodNet-io/bridges-js",
@@ -13,8 +13,8 @@
     "goodnet",
     "p2p",
     "websocket",
-    "json-rpc",
-    "bridge"
+    "wasm",
+    "transport"
   ],
   "type": "module",
   "main": "./dist/index.cjs",
